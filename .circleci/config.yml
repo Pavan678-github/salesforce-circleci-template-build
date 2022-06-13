@@ -3,7 +3,7 @@ aliases:
   # The ampersand character denotes an node anchor, this block can be referenced
   # elsewhere by &name
 - &sfdx_version
-  name: SFDX Version
+  name: makepositive/sfdx-ant
   command: |
     sfdx --version
     sfdx plugins --core
