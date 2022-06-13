@@ -1,109 +1,255 @@
-version: 2
-aliases:
-  # The ampersand character denotes an node anchor, this block can be referenced
-  # elsewhere by &name
-- &sfdx_version
-  name: makepositive/sfdx-ant
-  command: |
-    sfdx --version
-    sfdx plugins --core
-- &authorise_org
-  name: audiojak/docker-ssh-git
-  command: |
-  # Note: Some $VARs are environment set (in CircleCI UI), others are set
-  # within this build script
-    sfdx force:auth:jwt:grant --clientid $CLIENT_ID \
-                              --jwtkeyfile /tmp/keys/jwt.key \
-                              --username $USERNAME \
-                              --setalias $ALIAS
-- &lint
-  name: Lint Lightning Components
-  command: sfdx force:lightning:lint ./salestrip --exit --json
-- &create_scratch
-  name: Create the Scratch Org
-  command: |
-    sfdx force:org:create --definitionfile $SCRATCH_ORG_DEF \
-                          --targetdevhubusername $ALIAS \
-                          --setalias circle_build_$CIRCLE_BUILD_NUM \
-                          --wait $DEPLOY_TIMEOUT
-    sfdx force:org:open --targetusername circle_build_$CIRCLE_BUILD_NUM \
-                        --urlonly
-- &deploy
-  name: Deploy to Salesforce
-  command: sfdx force:source:push --targetusername circle_build_$CIRCLE_BUILD_NUM
-- &install_package
-  name: Install Package
-  command: |
-    INSTALL_VER=$(jq -r '.result.MetadataPackageVersionId' /tmp/workspace/packageId.json)
-    sfdx force:package:install --package $INSTALL_VER \
-                               --noprompt \
-                               --publishwait $DEPLOY_TIMEOUT \
-                               --targetusername $TARGET_USERNAME \
-                               --wait $DEPLOY_TIMEOUT
-- &apex_tests
-  name: Run Apex Tests
-  command: |
-    sfdx force:apex:test:run --testlevel RunLocalTests \
-                             --resultformat junit \
-                             --outputdir /tmp/test-results \
-                             --targetusername circle_build_$CIRCLE_BUILD_NUM \
-                             --wait $DEPLOY_TIMEOUT \
-                             --codecoverage
-    sfdx force:data:soql:query --usetoolingapi \
-                               --query "SELECT PercentCovered FROM ApexOrgWideCoverage" \
-                               --targetusername circle_build_$CIRCLE_BUILD_NUM \
-                               --json > /tmp/test-results/orgCoverage.json
-    sfdx force:data:soql:query --usetoolingapi \
-                               --query "SELECT ApexClassorTrigger.Name, NumLinesCovered,NumLinesUncovered \
-                                          FROM ApexCodeCoverageAggregate \
-                                         WHERE NOT(ApexClassorTrigger.Name LIKE '%Test') \
-                                      ORDER BY ApexClassorTrigger.Name" \
-                               --targetusername circle_build_$CIRCLE_BUILD_NUM \
-                               --json > /tmp/test-results/classCoverage.json
-    ORG_COVERAGE=$(jq .result.records[0].PercentCovered /tmp/test-results/orgCoverage.json)
-    printf "%s%% code coverage" "$ORG_COVERAGE"
-    if [[ $ORG_COVERAGE -lt 80 ]]; then false; fi
-- &delete_scratch
-  name: Delete Scratch Org
-  command: |
-    sfdx force:org:delete --targetusername circle_build_$CIRCLE_BUILD_NUM \
-                          --targetdevhubusername DevHub \
-                          --noprompt
-  when: always
-- &image # A SFDX specific docker image we've open sourced
+#   Todo:
+# - Manual approval for deployment to UAT/Prod
+# - Environment variable toggles for validating on every commit
+
+version: 2.1
+
+# Defining default values for all jobs
+defaults: &defaults
   docker:
-  - image: salestrip/sfdx-cli
-- &build_job # This job combines other nodes above
-  <<: *image
-  steps:
-  - checkout
-  - run: *sfdx_version
-  - run: *setup_env
-  - run: *authorise_org
-  - run: *lint
-  - run: *create_scratch
-  - run: *inject_keys
-  - run: *deploy
-  - run: *apex_tests
-  - run: *delete_scratch
-  - store_test_results:
-      path: /tmp/test-results
-  - store_artifacts:
-      path: /tmp/test-results
+    - image: appirio/dx-salesforce
+
 jobs:
-  build_and_test:
-    <<: *build_job
-    environment:
-      ALIAS: DevHub
-      SCRATCH_ORG_DEF: environments/scratch-defs/default-scratch-def.json
-# Workflows combine jobs AKA pipelines in other CI tools
+  ####################################################
+  # Authenticate the devhub using AuthUrl
+  ####################################################
+  authenticate-devhub:
+    <<: *defaults
+    steps:
+      - checkout
+      - run:
+          name: Authenticate DevHub
+          command: |
+            # Authenticate DevHub
+            echo $SFDX_AUTH_URL_DEVHUB_ORG > ~/devhub_auth.url
+            sfdx force:auth:sfdxurl:store -d -a DevHub -f ~/devhub_auth.url
+            # Generate and persist unique key based on repo + branchname
+            REPO_BRANCH_KEY="$CIRCLE_PROJECT_REPONAME"-"$CIRCLE_BRANCH"
+            echo $REPO_BRANCH_KEY
+            SCRATCH_ORG_NAME="ci-scratch/"$(echo $REPO_BRANCH_KEY | sed -E 's/[^[:alnum:]]+/-/g') # Replace non-alphanumeric characters with "-"
+            echo $SCRATCH_ORG_NAME
+            echo $SCRATCH_ORG_NAME > ~/project/scratch-org-alias
+      - persist_to_workspace_cmd
+
+  ####################################################
+  # Authenticate the integration sandbox
+  # (package deployment target) using AuthUrl
+  ####################################################
+  authenticate-integration-sandbox:
+    <<: *defaults
+    steps:
+      - attach_workspace_cmd
+      - run:
+          name: Authenticate integration sandbox
+          command: |
+            echo $SFDX_AUTH_URL_INTEGRATION_ORG > ~/int_auth.url
+            sfdx force:auth:sfdxurl:store -s -a IntegrationSandbox -f ~/int_auth.url
+      - persist_to_workspace_cmd
+
+  ####################################################
+  # Create a new package version
+  ####################################################
+  create-package-version:
+    <<: *defaults
+    steps:
+      - attach_workspace_cmd
+      - run:
+          name: Create package version
+          command: |
+            sfdx force:package:version:create -p $(cat sfdx-project.json | jq '.packageDirectories' | jq '.[0].package' -r) -d force-app --wait 10 -v DevHub -f config/project-scratch-def.json -k $SFDX_PACKAGE_KEY
+      - persist_to_workspace_cmd
+
+  ####################################################
+  # Install a new package version in a sandbox
+  ####################################################
+  install-package-version:
+    <<: *defaults
+    steps:
+      - attach_workspace_cmd
+      - run:
+          name: Install package version
+          command: |
+            PACKAGE_ALIAS=$(cat sfdx-project.json | jq '.packageDirectories' | jq '.[0].package' -r)
+            PACKAGE_VERSIONID=$(sfdx force:package:version:list -p $PACKAGE_ALIAS --orderby CreatedDate --json | jq '.result[-1].SubscriberPackageVersionId' -r)
+            sfdx force:package:install --wait 10 --publishwait 10 --package $PACKAGE_VERSIONID -u IntegrationSandbox --noprompt -k $SFDX_PACKAGE_KEY
+      - persist_to_workspace_cmd
+
+  ####################################################
+  # Delete the scratch org created for the previous
+  # CI run for this package. Scratch org is identified
+  # by an alias consisting of repo + branch name
+  ####################################################
+  delete-previous-scratch-org:
+    <<: *defaults
+    steps:
+      - attach_workspace_cmd
+      - delete-scratch-orgs
+
+  ####################################################
+  # Create a new scratch org based on the project's
+  # project-scratch-def.json file
+  ####################################################
+  create-scratch-org:
+    <<: *defaults
+    steps:
+      - attach_workspace_cmd
+      - run:
+          name: Create scratch org
+          command: |
+            # Create scratch org and assign orgname value to the unique key based on repo+branch name
+            sfdx force:org:create -v DevHub -s -f config/project-scratch-def.json -a $(cat ~/project/scratch-org-alias) -d 1 orgName=$(cat ~/project/scratch-org-alias)
+            echo "Created scratch org:"
+            sfdx force:org:display -u $(cat ~/project/scratch-org-alias)
+            # Parse scratch org login url and store it in a html document in order to create an artifact link that can open the scratch org for review
+            output="sfdx force:org:open --targetusername $(cat ~/project/scratch-org-alias) --urlonly --json" && (echo $cmd >&2)
+            url=$($output | jq -r ".result.url")
+            environment_html="<script>window.onload=function(){window.location.href=\"$url\"}</script>"
+            echo "$environment_html" > /tmp/open_review_app.html
+      - store_artifacts:
+          path: /tmp/open_review_app.html
+          destination: $CIRCLE_PROJECT_REPONAME
+      - persist_to_workspace_cmd
+
+  ####################################################
+  # Install package dependencies as defined in
+  # sfdx-project.json using the texei sfdx plugin
+  ####################################################
+  install-package-dependencies:
+    <<: *defaults
+    steps:
+      - attach_workspace_cmd
+      - run:
+          name: Install package
+          command: |
+            echo y | sfdx plugins:install rstk-sfdx-package-utils # echo y to confirm installation
+            sfdx rstk:package:dependencies:install -u $(cat ~/project/scratch-org-alias) -w 10 --noprecheck -k "1:$SFDX_PACKAGE_KEY 2:$SFDX_PACKAGE_KEY 3:$SFDX_PACKAGE_KEY 4:$SFDX_PACKAGE_KEY 5:$SFDX_PACKAGE_KEY"
+  ####################################################
+  # Push SFDX source to a scratch org
+  ####################################################
+  deploy-source:
+    <<: *defaults
+    steps:
+      - attach_workspace_cmd
+      - run:
+          name: Push Source
+          command: |
+            sfdx force:source:push -u $(cat ~/project/scratch-org-alias)
+            FILE=scripts/circleci_postdeploy.sh
+            if [ -f "$FILE" ]; then
+                echo "Post deploy step script found. Executing script:"
+                sh scripts/circleci_postdeploy.sh
+            fi
+  ####################################################
+  # Run all apex tests
+  ####################################################
+  run-apex-tests:
+    <<: *defaults
+    steps:
+      - attach_workspace_cmd
+      - run:
+          name: Run Apex Tests
+          command: |
+            mkdir -p ~/junit
+            FILE=scripts/circleci_runtests.sh
+            if [ -f "$FILE" ]; then
+                echo "Test running script found. Executing script:"
+                sh scripts/circleci_runtests.sh
+            else
+              echo "No test running script found. Executing local tests:"
+              sfdx force:apex:test:run -l RunLocalTests -c -d ~/junit -r junit --wait 5
+            fi
+      - store_test_results:
+          path: ~/junit
+
+  ####################################################
+  # COMMANDS
+  # Reusable commands called by individual jobs
+  ####################################################
+commands:
+  delete-scratch-orgs:
+    description: "Delete scratch org"
+    steps:
+      - run:
+          command: |
+            orgAlias=$(cat ~/project/scratch-org-alias)
+            result=$(sfdx force:data:soql:query --targetusername DevHub --query "SELECT SignupUsername FROM ScratchOrgInfo WHERE OrgName='$orgAlias'" --json)
+            usernames=$(echo $result | jq -r ".result.records|map(.SignupUsername)|.[]")
+            echo $usernames
+            for scratch_org_username in $usernames; do
+              echo "Deleting $scratch_org_username"
+              cmd="sfdx force:data:record:delete --sobjecttype ScratchOrgInfo --targetusername DevHub --where "'"SignupUsername='$scratch_org_username'"'" --json" && (echo $cmd >&2)
+              output=$($cmd) && (echo $output | jq '.' >&2)
+            done
+  attach_workspace_cmd:
+    steps:
+      - attach_workspace:
+          at: ~/
+  persist_to_workspace_cmd:
+    steps:
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - .sfdx/*
+            - project/*
+
 workflows:
-  version: 2
-  SalesTrip:
-    jobs: # There is only one job below but you could include more
-    - build_and_test:
-        filters:
-          branches:
-            ignore:
-            - uat
-            - master
+  ####################################################
+  # Run on every commit to master
+  ####################################################
+  validate_in_scratch_org:
+    jobs:
+      - authenticate-devhub:
+          context: salesforce-dx-ci
+          filters:
+            branches:
+              only: master
+      - delete-previous-scratch-org:
+          requires:
+            - authenticate-devhub
+      - create-scratch-org:
+          requires:
+            - delete-previous-scratch-org
+      - install-package-dependencies:
+          context: salesforce-dx-ci
+          requires:
+            - create-scratch-org
+      - deploy-source:
+          requires:
+            - install-package-dependencies
+      - run-apex-tests:
+          requires:
+            - deploy-source
+
+  ####################################################
+  # Run on release tags pushed to master commits
+  ####################################################
+  build_and_test:
+    jobs:
+      - authenticate-devhub:
+          context: salesforce-dx-ci
+          filters:
+            tags:
+              only: /^v[0-9].*/
+            branches:
+              ignore: /.*/
+      - authenticate-integration-sandbox:
+          context: salesforce-dx-ci
+          requires:
+            - authenticate-devhub
+          filters:
+            tags:
+              only: /^v[0-9].*/
+      - create-package-version:
+          context: salesforce-dx-ci
+          requires:
+            - authenticate-integration-sandbox
+          filters:
+            tags:
+              only: /^v[0-9].*/
+      - install-package-version:
+          context: salesforce-dx-ci
+          requires:
+            - create-package-version
+          filters:
+            tags:
+              only: /^v[0-9].*/
