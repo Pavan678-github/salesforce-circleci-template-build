@@ -8,7 +8,7 @@ aliases:
     sfdx --version
     sfdx plugins --core
 - &authorise_org
-  name: Authorise Org
+  name: audiojak/docker-ssh-git
   command: |
   # Note: Some $VARs are environment set (in CircleCI UI), others are set
   # within this build script
